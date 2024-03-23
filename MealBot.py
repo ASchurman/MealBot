@@ -4,192 +4,495 @@
 # solemn responsibility; misusing this script could send out a lot of mistaken, unwanted
 # emails.
 #
-# USAGE:
-# --PersonList.txt (default name for this can be redefined below):
-#   A tab-delimited (by default, but that's configurable) csv file of students.
-#   Each student must have 'Name' and 'Email'. Additional columns are OK, too.
-#   Delimiting it by tabs means that you can copy-paste directly from a Google sheet into
-#   a text file, and it will work.
-# --Message.txt:
-#   Create a file with the body of the email you want sent out to each pair. The string
+# Usage:
+# `python MealBot.py`
+#   Runs the script with the default arguments. This will randomly group students who have filled out the Google Form
+#   with SignupFormID while trying to avoid previous groups stored in the Google Sheet with GroupsSheetID, send an
+#   email to each group with the body of the email in Message.txt, and save the groups to the Google Sheet with
+#   GroupsSheetID.
+#
+# Important Arguments:
+# --email:
+#   The email address from which you want to send the emails. This email address must be a Gmail address.
+# --subject:
+#   The subject line for the emails. The string '{BiWeek}' should appear exactly once in this string; in the sent
+#   emails, '{BiWeek}' will be replaced with the week string (e.g. 'Week 1 & 2 | 01/01/20 - 01/14/20').
+# --custom-groupings:
+#   Use custom groupings instead of random groupings. This will prompt you to enter the custom groupings from a file.
+#   The file should contain a list of comma-separated names of students in each group, with each group on a new line.
+#   EX. Alice, Bob, Charlie
+#       David, Eve
+#       Grace, Henry
+# --this-week-group:
+#   Send emails for this week group instead of next week group. Usually used when you forgot to send out the MealBot
+#   on the first day of the week (Sunday), and you're sending it out a day or more into the week. A week group is the
+#   group of weeks that MealBot sends out groupings (i.e. every 1 week, 2 weeks, 3 weeks, etc).
+# --week-group-frequency:
+#   Frequency of week groups (1-52). Defaults to 2 (i.e. every other week).
+# --message-file:
+#   A file with the body of the email you want sent out to each group. The string
 #   '{GroupList}' should appear exactly once in this file; in the sent emails, '{GroupList}'
 #   will be replaced with the list of names in the group, separated by a new line (\n)
-#
-# -- In the simplest case, run MealBot without arguments. It'll randomly pair people from PersonList.txt,
-#    print the pairings, and then ask if you want to send the email to them all.
 
 import random
 import argparse
-import csv
 import httplib2
-import os
-import oauth2client
+import itertools
+from math import floor
+from tqdm import tqdm
+from datetime import date, timedelta
+from httplib2 import Http
 from oauth2client import client, tools, file
 import base64
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from email.message import EmailMessage
 from apiclient import errors, discovery
+import json
+
+from utils import *
+
+CREDENTIALS_FILE    = 'client_secret.json'
+TOKEN_FILE          = 'token.json'
+IDS_FILE            = 'ids.json'
+SCOPES              = ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/forms.responses.readonly', 'https://www.googleapis.com/auth/spreadsheets']
+DISCOVERY_DOC       = 'https://forms.googleapis.com/$discovery/rest?version=v1'
+GROUP_SIZE          = 2
+GROUPS_RANGE        = 'Sheet1!A2:B'
 
 # Defaults - can be overridden with arguments.
-PERSON_FILE_DELIMITER     = '\t'
-DEFAULT_PERSON_FILE       = 'PersonList.txt'
-DEFAULT_MESSAGE_FILE      = 'Message.txt'
-DEFAULT_GROUP_SIZE        = 2
-DEFAULT_BOT_EMAIL_ADDRESS = 'ysc.meal.bot@gmail.com'
-DEFAULT_SUBJECT           = "[YSC MealBot] This week's meal group!"
-DEFAULT_CREDENTIAL_FILE   = 'client_secret.json'
+DEFAULT_MESSAGE_FILE        = 'message.txt'
+DEFAULT_BOT_EMAIL_ADDRESS   = 'YSC Mealbot <josh.chough@yale.edu>'
+DEFAULT_SUBJECT             = "{BiWeek} | Your biweekly meal group!"
 
-SCOPES = 'https://www.googleapis.com/auth/gmail.send'
-APPLICATION_NAME = 'Gmail API Python Send Email'
+class Student:
+    def __init__(self, d):
+        try:
+            self.firstname = d['firstname']
+            self.lastname = d['lastname']
+            self.year = d['year']
+            self.college = d['college']
+            self.name = self.firstname + ' ' + self.lastname
+            self.email = d['email']
+        except KeyError as err:
+            print('Error: You must have a key for '+err.args[0]+' in your JSON file.')
+            print(d)
+            raise
 
-def main():
-    parser = argparse.ArgumentParser(description='''Randomly group students to get a meal together and 
-                                                    send an email to each group to inform them.''')
-    parser.add_argument('-p', '--person-file',
-                        help='''File containing the list of people to group. This must be a csv file, by 
-                                default delimited by tabs (but that's configurable in the script). 
-                                The columns 'Name' and 'Email' must be present. 
-                                Defaults to '''+DEFAULT_PERSON_FILE,
-                        default=DEFAULT_PERSON_FILE)
-    parser.add_argument('-m', '--message-file',
-                        help='''File containing the email body ({GroupList} in the file will be replaced 
-                                with the list of people in the group). Defaults to '''+DEFAULT_MESSAGE_FILE,
-                        default=DEFAULT_MESSAGE_FILE)
-    parser.add_argument('-g', '--group-size',
-                        help='How large each random group should be. Defaults to '+str(DEFAULT_GROUP_SIZE),
-                        default=DEFAULT_GROUP_SIZE)
-    parser.add_argument('-e', '--email',
-                        help='Gmail address from which to send emails. Defaults to '+DEFAULT_BOT_EMAIL_ADDRESS,
-                        default=DEFAULT_BOT_EMAIL_ADDRESS)
-    parser.add_argument('-s', '--subject',
-                        help='Subject line for the emails. Defaults to "'+DEFAULT_SUBJECT+'"',
-                        default=DEFAULT_SUBJECT)
-    parser.add_argument('-c', '--credential-file',
-                        help='''JSON file containing the credential provided by Google API. 
-                                Defaults to '''+DEFAULT_CREDENTIAL_FILE,
-                        default=DEFAULT_CREDENTIAL_FILE)
-    args = parser.parse_args()
-    mealBot(args.person_file, args.message_file, args.group_size, args.email, args.subject, args.credential_file)
+# Function to generate all possible combinations of k-groups from a list of students
+def generate_combinations(students):
+    print('Generating all possible combinations...', end='')
+    combinations = list(itertools.combinations(students, GROUP_SIZE))
+    print('Done')
+    return combinations
 
-def mealBot(personFilename, messageFilename, groupSize, sender, subject, credentialFilename):
+# Function to filter out combinations that have been used before
+def filter_combinations(combinations, prevGroups):
+    print('Filtering out previously used combinations...', end='')
+    new_groups = []
+    prevGroups = set([grp[1] for grp in prevGroups])
+    for grp in combinations:
+        if frozenset([student.name for student in grp]) not in prevGroups:
+            new_groups.append(grp)
+    print('Done')
+    return new_groups
+
+# Breaks the list l into chunks of size n. Assume that len(l) % n == 0.
+# Returns a list of lists.
+# EX. l = [0, 1, 2, 3]; n = 2. Returns [[0, 1], [2, 3]]
+def chunk(l):
+    # First break into chunks. Groups is a list of list of Students
+    n = max(1, GROUP_SIZE)
+    groups = [l[i:i + n] for i in range(0, len(l), n)]
+    return groups
+
+def print_header(header, length):
+    if length == 0:
+        print('\n{}: None'.format(header))
+        return
+    else:
+        print('\n{} [{}]:'.format(header, length))
+
+def print_groups(header, groups, student=True, emails=False):
+    last_week_group = None if student else groups[-1][0]
+    print_header(header, len(groups))
+
+    week_group = None
+    week_group_count = 0
+    last_group = []
+
+    for grp in groups:
+        if not student:
+            week, group = grp
+            if week != week_group:
+                if week_group_count > 0:
+                    print('{}'.format(week_group_count))
+                week_group_count = 0
+                print("\t{}: ".format(week), end='')
+                week_group = week
+            week_group_count += 1
+            if week == last_week_group:
+                last_group.append(', '.join([name for name in group]))
+        elif emails:
+            print('\t{}'.format(', '.join(['{} ({})'.format(student.name, student.email) for student in grp])))
+        else:
+            print('\t{}'.format(', '.join([student.name for student in grp])))
+
+    if not student:
+        print('{}'.format(week_group_count))
+        for names in last_group:
+            print('\t\t{}'.format(names))
+
+def print_students(header, students):
+    print_header(header, len(students))
+    for student in students:
+        print('\t{}'.format(student.name))
+
+def getIds(filename):
+    print('Reading ids file...', end='')
+    with open(filename, 'r') as idsFile:
+        ids = json.load(idsFile)
+    print('Done')
+    return ids
+
+def getMessage(messageFilename):
+    print('Reading message file...', end='')
     messageFile = open(messageFilename, 'r')
     message = messageFile.read()
     messageFile.close()
-    
-    # Get a random list of Students
-    personList = formPersonList(personFilename)
-    
-    if len(personList) == 1:
-        print('You must have more than 1 student.')
-        return
-    
-    # Divide into groups
-    groups = chunk(personList, groupSize)
-    
-    # Print the groups
-    print('Randomized groups:\n')
-    for grp in groups:
-        for person in grp:
-            print(person.name, person.email, sep='\t')
-        print()
-    
-    print('Subject: '+subject)
-    print('\nBody:\n'+message)
-    
-    # Send email?
-    if input('Send emails? (Y/n) =>') == 'Y':
-        print('Sending emails...')
-        sendEmails(groups, sender, subject, message, credentialFilename)
-        print('Emails away!')
-    else:
-        print('Not sending emails.')
+    print('Done')
+    return message
 
-class Person:
-    def __init__(self, d):
-        try:
-            self.name = d['Name']
-            self.email = d['Email']
-        except KeyError as err:
-            print('Your person list file must have columns titled "Name" and "Email"')
-            print(d)
-            raise
-        self.fields = d
-        self.paired = False
-    
-    def __getitem__(self, key):
-        return self.fields[key]
-
-def formPersonList(person_file):
-    # Initialize list to hold persons
-    personList = []
-    with open(person_file, newline='') as csvfile:
-        reader = csv.DictReader(csvfile, delimiter=PERSON_FILE_DELIMITER)
-        for row in reader:
-            personList.append(Person(row))
-    
-    # Return randomized list
-    random.shuffle(personList)
-    return personList
-
-# Breaks the list l into chunks of size n. Remainders are distributed to other chunks.
-# Returns a list of lists.
-# EX. l = [0, 1, 2, 3]; n = 2. Returns [[0, 1], [2, 3]]
-def chunk(l, n):
-    # First break into chunks. Groups is a list of list of Students
-    n = max(1, n)
-    groups = [l[i:i + n] for i in range(0, len(l), n)]
-    
-    # Now if there are any singletons (they'll be at the end of the list), add them to other groups
-    while len(groups[-1]) == 1:
-        groups[-2].append(groups[-1].pop())
-        groups.pop()
-    return groups
-
-def sendEmails(groups, sender, subject, rawBody, credentialFilename):
-    credentials = getCredentials(credentialFilename)
-    http = credentials.authorize(httplib2.Http())
-    service = discovery.build('gmail', 'v1', http=http)
-    
-    for grp in groups:
-        namesLst = [person.name for person in grp]
-        emailsLst = [person.email for person in grp]
-        body = rawBody.replace('{GroupList}', '\n'.join(namesLst))
-        emails = ', '.join(emailsLst)
-        message = createMessage(emails, sender, subject, body)
-        sendMessage(service, "me", message)
-
-def createMessage(toEmails, sender, subject, plaintext):
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From'] = sender
-    msg['To'] = toEmails
-    msg.attach(MIMEText(plaintext, 'plain'))
-    raw = base64.urlsafe_b64encode(msg.as_bytes())
-    raw = raw.decode()
-    body = {'raw': raw}
-    return body
-
-def getCredentials(credentialFilename):
-    home_dir = os.path.expanduser('~')
-    credential_dir = os.path.join(home_dir, '.credentials')
-    if not os.path.exists(credential_dir):
-        os.makedirs(credential_dir)
-    credential_path = os.path.join(credential_dir, 'gmail-python-email-send.json')
-    store = oauth2client.file.Storage(credential_path)
+def getCredentials(credentialFilename, tokenFilename, user_agent):
+    print('Getting credentials...', end='')
+    store = file.Storage(tokenFilename)
     credentials = store.get()
     if not credentials or credentials.invalid:
         flow = client.flow_from_clientsecrets(credentialFilename, SCOPES)
-        flow.user_agent = APPLICATION_NAME
+        flow.user_agent = user_agent
         credentials = tools.run_flow(flow, store)
-        print('Storing credentials to ' + credential_path)
+        print('Storing credentials to ' + tokenFilename)
+    print('Done')
     return credentials
+
+def getStudents(credentials, ids):
+    print('Getting students...', end='')
+    students, opted_out = [], []
+    service = discovery.build('forms', 'v1', http=credentials.authorize(Http()), discoveryServiceUrl=DISCOVERY_DOC, static_discovery=False)
+    result = service.forms().responses().list(formId=ids["SIGNUP_FORM_ID"]).execute()
+    for response in result['responses']:
+        if ids["OPT_IN_QID"] in response['answers'].keys():
+            opt_in = response['answers'][ids["OPT_IN_QID"]]['textAnswers']['answers'][0]['value']
+            if opt_in == ids["OPT_IN_NO"]:
+                opted_out.append(response['respondentEmail'].strip())
+                continue
+        students.append(Student({
+            'firstname': response['answers'][ids["FIRST_NAME_QID"]]['textAnswers']['answers'][0]['value'].strip(),
+            'lastname': response['answers'][ids["LAST_NAME_QID"]]['textAnswers']['answers'][0]['value'].strip(),
+            'year': response['answers'][ids["YEAR_QID"]]['textAnswers']['answers'][0]['value'],
+            'college': response['answers'][ids["COLLEGE_QID"]]['textAnswers']['answers'][0]['value'],
+            'email': response['respondentEmail'].strip()
+        }))
+    print('Done ({} opted in, {} opted out)'.format(len(students), len(opted_out)))
+    return students
+
+def getPrevGroups(credentials, spreadsheetId, range):
+    print('\nGetting previous groups...', end='')
+    prevGroups = []
+    sheet = None
+    try:
+        service = discovery.build('sheets', 'v4', credentials=credentials)
+        sheet = service.spreadsheets()
+        result = sheet.values().get(spreadsheetId=spreadsheetId, range=range).execute()
+        values = result.get('values', [])
+        for row in values:
+            # Pack into tuple (week, set of students in group)
+            prevGroups.append([row[0], frozenset(row[1].split(', '))])
+        print('Done')
+    except errors.HttpError as error:
+        print('Failed')
+        print('Error: %s' % error)
+    return prevGroups, sheet
+
+def findGroups(students, prevGroups, customGroupings):
+    groups = []
+
+    if customGroupings:
+        numGroups = floor(len(students)/GROUP_SIZE)
+        odd = True if len(students) % GROUP_SIZE == 1 else False
+        if odd:
+            print('\nYou will need to enter {} groups of {} students each and 1 group of {} students.'.format(numGroups-1, GROUP_SIZE, GROUP_SIZE+1))
+        else:
+            print('\nYou will need to enter {} groups of {} students each.'.format(numGroups, GROUP_SIZE))
+
+        # Get custom groupings from file
+        customGroupingsFile = open(input('\nWhich custom groupings file would you like to use?\n > '), 'r')
+        customGroupings = customGroupingsFile.read().splitlines()
+        customGroupingsFile.close()
+
+        while (len(customGroupings) > 0):
+            # Get next group
+            group = customGroupings.pop(0).split(', ')
+            group = [name.strip() for name in group]
+            group = [student for student in students if student.name in group]
+            if len(group) < GROUP_SIZE:
+                print('Error: You must have at least {} students in a group.'.format(GROUP_SIZE))
+                continue
+            if group[0].name == group[1].name:
+                print('Error: You cannot have the same student in a group twice.')
+                continue
+            for g in groups:
+                if len(set(g).intersection(set(group))) > 0:
+                    print('Error: You cannot have the same student ({}) in multiple groups.'.format(g[0].name))
+                    continue
+            groups.append(group)
+
+        print_groups('Tentative custom groups', groups)
+        if (len(groups) != numGroups):
+            print('Error: You must have {} groups of students.'.format(numGroups))
+            exit()
+        numStudents = sum([len(group) for group in groups])
+        if (numStudents != len(students)):
+            print('Error: You must have {} students in total.'.format(len(students)))
+            exit()
+    else:
+        # Randomize the list of students
+        print('\nShuffling students...', end='')
+        random.shuffle(students)
+        print('Done')
+
+        # Handle odd number of students
+        odd = False
+        odd_student = None
+        if len(students) % GROUP_SIZE == 1:
+            print('\nOdd number of students detected! Saving the odd student for later...', end='')
+            odd = True
+            odd_student = students.pop()
+            print('Done\n')
+
+        # Generate all possible combinations of groups
+        combinations = generate_combinations(students)
+        new_groups = filter_combinations(combinations, prevGroups)
+        print('Total new combinations: {}/{}'.format(len(new_groups), len(combinations)))
+
+        # Find the set of groups that maximizes the number of new groups
+        participants = []
+        for i, ngrp in enumerate(new_groups):
+            temp_students = [student for student in ngrp]
+            temp_groups = [ngrp]
+            for j in range(i+1, len(new_groups)):
+                mgrp = new_groups[j]
+                if len(set(mgrp).intersection(set(temp_students))) == 0:
+                    temp_students.extend(mgrp)
+                    temp_groups.append(mgrp)
+            if len(temp_groups) > len(groups):
+                groups = temp_groups
+                participants = temp_students
+        print_groups('New groups', groups)
+
+        # Group the remaining students that were not in the optimal set of groups
+        if len(participants) != len(students):
+            remaining_students = [student for student in students if student not in participants]
+            print_students('Remaining students', remaining_students)
+            old = chunk(remaining_students)
+            print_groups('Old groups', old)
+            groups.extend(old)
+
+        groups = [list(grp) for grp in groups]
+
+        # Add the odd student to the first group
+        if odd:
+            print('\nAdding odd student ({}) to the first group...'.format(odd_student.name), end='')
+            groups[0].append(odd_student)
+            print('Done')
+    
+    return groups
+
+def getWeekString(n, thisWeek=False, withNums=False):
+    today = date.today()
+    start = today + timedelta(days=(6 - today.weekday()))
+    if thisWeek:
+        start = start - timedelta(days=7)
+    weekGroupLength = 7 * n - 1
+    end = start + timedelta(days=weekGroupLength)
+    monday = start + timedelta(days=1)
+    if withNums:
+        return f"Week {monday.strftime('%W').zfill(2)} & {str(int(monday.strftime('%W'))+1).zfill(2)} | {start.strftime('%m/%d/%y')} - {end.strftime('%m/%d/%y')}"
+    else:
+        return f"{start.strftime('%m/%d/%y')} - {end.strftime('%m/%d/%y')}"
+
+def saveGroups(groups, sheet, spreadsheetId, range, week):
+    currRow = len(sheet.values().get(spreadsheetId=spreadsheetId, range=range).execute().get('values', [])) + 2
+    sheet.values().update(spreadsheetId=spreadsheetId, range=f"Sheet1!A{currRow}:B", valueInputOption='USER_ENTERED', body={
+        'values': [[week, ', '.join([student.name for student in grp])] for grp in groups]
+    }).execute()
+
+def createMessage(sender, subject, plaintext, toEmails=None, bccEmails=None):
+    message = EmailMessage()
+
+    message.set_content(plaintext)
+    if toEmails:
+        message['To'] = toEmails
+    if bccEmails:
+        message['Bcc'] = bccEmails
+    message['From'] = sender
+    message['Subject'] = '[YSC MealBot] {}'.format(subject)
+
+    encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    body = {
+        'raw': encoded_message
+    }
+    return body
 
 def sendMessage(service, userID, message):
     try:
         message = (service.users().messages().send(userId=userID, body=message).execute())
         return message
     except errors.HttpError as error:
-        print('An error occurred: %s' % error)
+        print('Error: %s' % error)
+
+def sendEmails(groups, sender, subject, rawBody, credentials):
+    http = credentials.authorize(httplib2.Http())
+    service = discovery.build('gmail', 'v1', http=http)
+    
+    groups = tqdm(groups, desc='Sending emails')
+    for grp in groups:
+        namesLst = [student.name for student in grp]
+        emailsLst = [student.email for student in grp]
+        groupList = '\n'.join(namesLst)
+        if len(namesLst) > GROUP_SIZE:
+            groupList += '\n(Note: We have an odd number of students this week, so this is the lucky group with 3 students!)'
+        body = rawBody.replace('{GroupList}', groupList)
+        emails = ', '.join(emailsLst)
+        message = createMessage(sender, subject, body, toEmails=emails)
+        sendMessage(service, "me", message)
+
+def sendBroadcastEmail(students, sender, subject, body, credentials):
+    http = credentials.authorize(httplib2.Http())
+    service = discovery.build('gmail', 'v1', http=http)
+
+    emails = ', '.join([student.email for student in students])
+    message = createMessage(sender, subject, body, toEmails=None, bccEmails=emails)
+    sendMessage(service, "me", message)
+
+def groupStudents(args, ids, message, credentials, students):
+    # Get previous groups
+    prevGroups, sheet = getPrevGroups(credentials, ids["GROUPS_SHEET_ID"], GROUPS_RANGE)
+    if sheet is None:
+        print('Error: Could not get previous groups.')
+        return
+    print_groups('Previous groups', prevGroups, student=False)
+
+    # Find optimal groups
+    groups = findGroups(students, prevGroups, args.custom_groupings)
+    print_groups('Final groups', groups, emails=True)
+
+    # Confirm groups?
+    if input('\nContinue? (Y/n)\n> ').lower() != 'y':
+        print('Exiting...')
+        return
+
+    # Get the week string
+    week = getWeekString(args.week_group_frequency, args.this_week_group)
+
+    # Print the email template
+    print('\n ~~~~ EMAIL START ~~~~')
+    print('\nFrom: {}'.format(args.email))
+    args.subject = args.subject.replace('{BiWeek}', week)
+    print('Subject: [YSC MealBot] {}'.format(args.subject))
+    print('\nBody:\n{}'.format(message))
+    print('\n ~~~~ EMAIL END ~~~~')
+
+    # Send email?
+    if input('\nSend emails? (Y/n)\n> ').lower() != 'y':
+        print('Exiting...')
+        return
+
+    sendEmails(groups, args.email, args.subject, message, credentials)
+    print('Sending emails...Done')
+
+    # Save the groups
+    print('Saving groups...', end='')
+    week = getWeekString(args.week_group_frequency, args.this_week_group, withNums=True)
+    saveGroups(groups, sheet, ids["GROUPS_SHEET_ID"], GROUPS_RANGE, week)
+    print('Done')
+
+def broadcast(args, message, credentials, students):
+    # Print the email template
+    print('\n ~~~~ EMAIL START ~~~~')
+    print('\nFrom: {}'.format(args.email))
+    print('Subject: [YSC MealBot] {}'.format(args.subject))
+    print('\nBody:\n{}'.format(message))
+    print('\n ~~~~ EMAIL END ~~~~')
+
+    # Send email?
+    if input('\nSend emails? (Y/n)\n> ').lower() != 'y':
+        print('Exiting...')
+        return
+
+    # Send broadcast email with all students BCC'd
+    sendBroadcastEmail(students, args.email, args.subject, message, credentials)
+    print('Sending emails...Done')
+
+def mealBot(args):
+    # Read the ids file
+    ids = getIds(IDS_FILE)
+
+    # Read the broadcast file
+    message = getMessage(args.message_file)
+
+    # Get credentials
+    credentials = getCredentials(CREDENTIALS_FILE, TOKEN_FILE, ids["APPLICATION_NAME"])
+
+    # Get a list of students
+    students = getStudents(credentials, ids)
+    print_students('Students', students)
+
+    if len(students) == 1:
+        print('Error: You must have more than 1 student.')
+        return
+
+    if args.broadcast:
+        broadcast(args, message, credentials, students)
+    else:
+        groupStudents(args, ids, message, credentials, students)
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='''Randomly group students to get a meal together and 
+                                                    send an email to each group to inform them.''')
+    parser.add_argument('-e', '--email',
+                        help='Gmail address from which to send emails. Defaults to '+DEFAULT_BOT_EMAIL_ADDRESS,
+                        default=DEFAULT_BOT_EMAIL_ADDRESS)
+    parser.add_argument('-s', '--subject',
+                        help='Subject line for the emails. Defaults to "'+DEFAULT_SUBJECT+'"',
+                        default=DEFAULT_SUBJECT)
+    parser.add_argument('-m', '--message-file',
+                        help='''File containing the email body ({GroupList} in the file will be replaced 
+                                with the list of students in the group). Defaults to '''+DEFAULT_MESSAGE_FILE,
+                        default=DEFAULT_MESSAGE_FILE)
+    parser.add_argument('-b', '--broadcast',
+                        help='''Send a broadcast email to all students. Defaults to False.''',
+                        default=False, const=True,
+                        type=str2bool,
+                        nargs='?')
+    parser.add_argument('--custom-groupings',
+                        help='''Use custom groupings instead of random groupings. Defaults to False.''',
+                        default=False, const=True,
+                        type=str2bool,
+                        nargs='?')
+    parser.add_argument('--this-week-group',
+                        help='''Send emails for this week group instead of next week group. Usually used when
+                                you forgot to send out the MealBot on the first day of the week (Sunday), and
+                                you're sending it out a day or more into the week. A week group is the group
+                                of weeks that MealBot sends out groupings (i.e. every 1 week, 2 weeks, 3 weeks,
+                                etc). Defaults to False.''',
+                        default=False, const=True,
+                        type=str2bool,
+                        nargs='?')
+    parser.add_argument('--week-group-frequency',
+                        help='''Frequency of week groups (1-52). Defaults to 2 (i.e. every other week).''',
+                        default=2,
+                        type=int,
+                        choices=range(1, 53))
+
+    args = parser.parse_args()
+
+    mealBot(args)
